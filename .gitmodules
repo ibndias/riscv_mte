@@ -1,7 +1,7 @@
 [submodule "src/qemu"]
 	path = src/qemu
-	url = https://github.com/gattaca-lab/qemu
+	url = https://github.com/ibndias/qemu
 	branch = riscv_mte-devel
 [submodule "src/riscv-gnu-toolchain"]
 	path = src/riscv-gnu-toolchain
-	url = https://github.com/gattaca-lab/riscv-gnu-toolchain
+	url = https://github.com/ibndias/riscv-gnu-toolchain
