@@ -14,7 +14,8 @@ function build_tests ()
     for test in $(ls ${TESTS_SRC_DIR})
     do
         testbin=$(echo ${test} | sed 's/\..*//g')
-        riscv64-unknown-elf-gcc ${TESTS_SRC_DIR}/${test} ${CFLAGS} -o ${testbin}
+        #riscv64-unknown-elf-gcc ${TESTS_SRC_DIR}/${test} ${CFLAGS} -o ${testbin}
+        ${INSTALL_DIR}/bin/riscv64-unknown-elf-gcc ${TESTS_SRC_DIR}/${test} ${CFLAGS} -o ${testbin}
     done
 }
 
