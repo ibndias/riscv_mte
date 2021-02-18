@@ -2,7 +2,7 @@
 
 source scripts/env.sh
 
-CFLAGS="-O0 -nostdlib -T ${ROOT_DIR}/scripts/qemu.ld"
+CFLAGS="-O0 -g -nostdlib -T ${ROOT_DIR}/scripts/qemu.ld"
 
 function build_tests ()
 {
