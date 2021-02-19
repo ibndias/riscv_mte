@@ -41,4 +41,4 @@ handler:
 
 .align 8
 test_data:
-.byte 0x12345678
+.dword 0x12345678

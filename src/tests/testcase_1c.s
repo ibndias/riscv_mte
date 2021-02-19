@@ -17,7 +17,7 @@ main:
     ld a3, 0(a2)
     /* compare with reference data */
     li a4, 0x12345678
-    bne a3, a3, fail
+    bne a3, a4, fail
 
 success:
     li a0, 0
@@ -31,4 +31,4 @@ fail:
 
 .align 8
 test_data:
-.byte 0x12345678
+.dword 0x12345678
