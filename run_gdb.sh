@@ -1,0 +1,1 @@
+riscv64-unknown-elf-gdb -ex 'target remote :1234' -ex 'b rest_of_boot_loader' -ex 'layout regs' -ex 'c' ${1}
