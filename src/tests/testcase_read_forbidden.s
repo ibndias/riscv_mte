@@ -6,6 +6,7 @@ main:
     /* register exception handler */
     la a0, handler
     csrw mtvec, a0
+    csrr a0, mtvec
     /* enable tbi and mte */
     li a0, 0x1
     csrw 0x8c0, a0
@@ -34,6 +35,7 @@ fail:
     /* writing to 0x8c3 csr makes qemu to exit */
     csrw 0x8c3, a0
 
+.align 8
 handler:
     /* read fault reason */
     csrr a7, mcause
