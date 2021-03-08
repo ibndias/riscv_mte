@@ -1,0 +1,12 @@
+target remote :1234
+b main
+layout regs
+set logging overwrite on
+set logging on
+set height 0
+set style enabled off
+while 1 
+    x/i $pc
+    stepi
+end
+quit
