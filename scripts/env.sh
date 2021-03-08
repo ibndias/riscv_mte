@@ -3,7 +3,7 @@
 SRC_DIR="${ROOT_DIR}/src"
 BUILD_DIR="${ROOT_DIR}/build"
 INSTALL_DIR="${ROOT_DIR}/install"
-RISCV_ISA_TARGET=rv64gc
+RISCV_ISA_TARGET=rv64g
 
 QEMU_SRC_DIR="${SRC_DIR}/qemu"
 GCC_SRC_DIR="${SRC_DIR}/riscv-gnu-toolchain"
