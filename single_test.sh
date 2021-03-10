@@ -2,7 +2,7 @@
 #set -x
 echo "Running QEMU..."
 ./scripts/run_qemu_dbg.sh ${1} . &
-#gnome-terminal -e "./run_gdb.sh ${1}" --window --maximize
+gnome-terminal -e "./run_gdb.sh ${1}" --window --maximize
 
 
 
