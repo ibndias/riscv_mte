@@ -2,6 +2,7 @@
 
 source scripts/env.sh
 
+#CFLAGS="-O0 -g -nostdlib -fomit-frame-pointer -T ${ROOT_DIR}/scripts/qemu.ld"
 CFLAGS="-O0 -g -nostdlib -T ${ROOT_DIR}/scripts/qemu.ld"
 
 function build_tests ()
@@ -15,7 +16,8 @@ function build_tests ()
     do
         testbin=$(echo ${test} | sed 's/\..*//g')
         #riscv64-unknown-elf-gcc ${TESTS_SRC_DIR}/${test} ${CFLAGS} -o ${testbin}
-        ${INSTALL_DIR}/bin/riscv64-unknown-elf-gcc ${TESTS_SRC_DIR}/${test} ${CFLAGS} -o ${testbin}
+        #${INSTALL_DIR}/bin/riscv64-unknown-elf-gcc ${TESTS_SRC_DIR}/${test} ${CFLAGS} -o ${testbin}
+        ${INSTALL_DIR}/bin/riscv64-unknown-linux-gnu-gcc ${TESTS_SRC_DIR}/${test} ${CFLAGS} -o ${testbin}
     done
 }
 
