@@ -8,5 +8,11 @@ void main()
     a[1]='b';
     a[2]='c';
     printf("Hello RISCV: %c\n", a[0]);
+    foo();
 
+}
+
+int foo)()
+{
+    return 0;
 }

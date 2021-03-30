@@ -12,7 +12,7 @@ ${QEMU_BIN} \
     -nographic \
     -bios none -s -S\
     -machine virt -singlestep \
-    #-plugin ../qemu/build/tests/plugin/libhowvec.so,arg=a0 -d plugin -D debug_out.txt\
     -kernel ${1} \
     -m 1024M
+    #-plugin ../qemu/build/tests/plugin/libhowvec.so,arg=a0 -d plugin -D debug_out.txt\
 exit $?
