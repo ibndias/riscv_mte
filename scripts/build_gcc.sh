@@ -11,7 +11,7 @@ function build_gcc ()
     set -e
     make linux -j${CPU_NUM}
     
-    ${GCC_SRC_DIR}/configure --prefix="${INSTALL_DIR}" --with-arch=${RISCV_ISA_TARGET}# --enable-multilib
+    ${GCC_SRC_DIR}/configure --prefix="${INSTALL_DIR}" --with-arch=${RISCV_ISA_TARGET} --enable-multilib
     set -e
     make newlib -j${CPU_NUM}
 }

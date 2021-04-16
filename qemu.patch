@@ -1,0 +1,1249 @@
+diff --git a/TODO b/TODO
+new file mode 100644
+index 0000000000..c071ab0e70
+--- /dev/null
++++ b/TODO
+@@ -0,0 +1 @@
++https://github.org/rth7680/qemu.git
+diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
+index bb9897b25a..f2faa3103b 100644
+--- a/accel/tcg/cputlb.c
++++ b/accel/tcg/cputlb.c
+@@ -33,6 +33,7 @@
+ #include "exec/helper-proto.h"
+ #include "qemu/atomic.h"
+ #include "qemu/atomic128.h"
++#include "translate-all.h"
+ 
+ /* DEBUG defines, enable DEBUG_TLB_LOG to log to the CPU_LOG_MMU target */
+ /* #define DEBUG_TLB */
+@@ -1815,3 +1816,110 @@ uint64_t helper_be_ldq_cmmu(CPUArchState *env, target_ulong addr,
+     return load_helper(env, addr, oi, retaddr, 8, true, true,
+                        helper_be_ldq_cmmu);
+ }
++
++
++static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
++                           CPUIOTLBEntry *iotlbentry, uintptr_t retaddr)
++{
++    ram_addr_t ram_addr = mem_vaddr + iotlbentry->addr;
++
++    trace_memory_notdirty_write_access(mem_vaddr, ram_addr, size);
++
++    if (!cpu_physical_memory_get_dirty_flag(ram_addr, DIRTY_MEMORY_CODE)) {
++        struct page_collection *pages
++            = page_collection_lock(ram_addr, ram_addr + size);
++        tb_invalidate_phys_page_fast(pages, ram_addr, size);
++        page_collection_unlock(pages);
++    }
++
++    /*
++     * Set both VGA and migration bits for simplicity and to remove
++     * the notdirty callback faster.
++     */
++    cpu_physical_memory_set_dirty_range(ram_addr, size, DIRTY_CLIENTS_NOCODE);
++
++    /* We remove the notdirty callback only if the code has been flushed. */
++    if (!cpu_physical_memory_is_clean(ram_addr)) {
++        trace_memory_notdirty_set_dirty(mem_vaddr);
++        tlb_set_dirty(cpu, mem_vaddr);
++    }
++}
++
++static int probe_access_internal(CPUArchState *env, target_ulong addr,
++                                 int fault_size, MMUAccessType access_type,
++                                 int mmu_idx, bool nonfault,
++                                 void **phost, uintptr_t retaddr)
++{
++    uintptr_t index = tlb_index(env, mmu_idx, addr);
++    CPUTLBEntry *entry = tlb_entry(env, mmu_idx, addr);
++    target_ulong tlb_addr, page_addr;
++    size_t elt_ofs;
++    int flags;
++
++    switch (access_type) {
++    case MMU_DATA_LOAD:
++        elt_ofs = offsetof(CPUTLBEntry, addr_read);
++        break;
++    case MMU_DATA_STORE:
++        elt_ofs = offsetof(CPUTLBEntry, addr_write);
++        break;
++    case MMU_INST_FETCH:
++        elt_ofs = offsetof(CPUTLBEntry, addr_code);
++        break;
++    default:
++        g_assert_not_reached();
++    }
++    tlb_addr = tlb_read_ofs(entry, elt_ofs);
++
++    page_addr = addr & TARGET_PAGE_MASK;
++    if (!tlb_hit_page(tlb_addr, page_addr)) {
++        if (!victim_tlb_hit(env, mmu_idx, index, elt_ofs, page_addr)) {
++            CPUState *cs = env_cpu(env);
++            CPUClass *cc = CPU_GET_CLASS(cs);
++
++            if (!cc->tlb_fill(cs, addr, fault_size, access_type,
++                              mmu_idx, nonfault, retaddr)) {
++                /* Non-faulting page table read failed.  */
++                *phost = NULL;
++                return TLB_INVALID_MASK;
++            }
++
++            /* TLB resize via tlb_fill may have moved the entry.  */
++            entry = tlb_entry(env, mmu_idx, addr);
++        }
++        tlb_addr = tlb_read_ofs(entry, elt_ofs);
++    }
++    flags = tlb_addr & TLB_FLAGS_MASK;
++
++    /* Fold all "mmio-like" bits into TLB_MMIO.  This is not RAM.  */
++//    if (unlikely(flags & ~(TLB_WATCHPOINT | TLB_NOTDIRTY))) {
++    if (unlikely(flags & ~(TLB_NOTDIRTY))) {
++        *phost = NULL;
++        return TLB_MMIO;
++    }
++
++    /* Everything else is RAM. */
++    *phost = (void *)((uintptr_t)addr + entry->addend);
++    return flags;
++}
++
++int probe_access_flags(CPUArchState *env, target_ulong addr,
++                       MMUAccessType access_type, int mmu_idx,
++                       bool nonfault, void **phost, uintptr_t retaddr)
++{
++    int flags;
++
++    flags = probe_access_internal(env, addr, 0, access_type, mmu_idx,
++                                  nonfault, phost, retaddr);
++
++    /* Handle clean RAM pages.  */
++    if (unlikely(flags & TLB_NOTDIRTY)) {
++        uintptr_t index = tlb_index(env, mmu_idx, addr);
++        CPUIOTLBEntry *iotlbentry = &env_tlb(env)->d[mmu_idx].iotlb[index];
++
++        notdirty_write(env_cpu(env), addr, 1, iotlbentry, retaddr);
++        flags &= ~TLB_NOTDIRTY;
++    }
++
++    return flags;
++}
+diff --git a/disas/riscv.c b/disas/riscv.c
+index 278d9be924..6a4356dba0 100644
+--- a/disas/riscv.c
++++ b/disas/riscv.c
+@@ -211,7 +211,7 @@ typedef enum {
+     rv_op_sllw = 49,
+     rv_op_srlw = 50,
+     rv_op_sraw = 51,
+-    rv_op_ldu = 52,
++    rv_op_lt = 52,
+     rv_op_lq = 53,
+     rv_op_sq = 54,
+     rv_op_addid = 55,
+@@ -478,6 +478,7 @@ typedef enum {
+     rv_op_fsflags = 316,
+     rv_op_fsrmi = 317,
+     rv_op_fsflagsi = 318,
++    rv_op_st = 319,
+ } rv_op;
+ 
+ /* structures */
+@@ -833,6 +834,7 @@ const rv_opcode_data opcode_data[] = {
+     { "lwu", rv_codec_i, rv_fmt_rd_offset_rs1, NULL, 0, 0, 0 },
+     { "ld", rv_codec_i, rv_fmt_rd_offset_rs1, NULL, 0, 0, 0 },
+     { "sd", rv_codec_s, rv_fmt_rs2_offset_rs1, NULL, 0, 0, 0 },
++    { "st", rv_codec_s, rv_fmt_rs2_offset_rs1, NULL, 0, 0, 0 },
+     { "addiw", rv_codec_i, rv_fmt_rd_rs1_imm, rvcp_addiw, 0, 0, 0 },
+     { "slliw", rv_codec_i_sh5, rv_fmt_rd_rs1_imm, NULL, 0, 0, 0 },
+     { "srliw", rv_codec_i_sh5, rv_fmt_rd_rs1_imm, NULL, 0, 0, 0 },
+@@ -842,7 +844,7 @@ const rv_opcode_data opcode_data[] = {
+     { "sllw", rv_codec_r, rv_fmt_rd_rs1_rs2, NULL, 0, 0, 0 },
+     { "srlw", rv_codec_r, rv_fmt_rd_rs1_rs2, NULL, 0, 0, 0 },
+     { "sraw", rv_codec_r, rv_fmt_rd_rs1_rs2, NULL, 0, 0, 0 },
+-    { "ldu", rv_codec_i, rv_fmt_rd_offset_rs1, NULL, 0, 0, 0 },
++    { "lt", rv_codec_i, rv_fmt_rd_offset_rs1, NULL, 0, 0, 0 },
+     { "lq", rv_codec_i, rv_fmt_rd_offset_rs1, NULL, 0, 0, 0 },
+     { "sq", rv_codec_s, rv_fmt_rs2_offset_rs1, NULL, 0, 0, 0 },
+     { "addid", rv_codec_i, rv_fmt_rd_rs1_imm, NULL, 0, 0, 0 },
+@@ -1485,7 +1487,7 @@ static void decode_inst_opcode(rv_decode *dec, rv_isa isa)
+             case 4: op = rv_op_lbu; break;
+             case 5: op = rv_op_lhu; break;
+             case 6: op = rv_op_lwu; break;
+-            case 7: op = rv_op_ldu; break;
++            case 7: op = rv_op_lt; break;
+             }
+             break;
+         case 1:
+@@ -1547,6 +1549,7 @@ static void decode_inst_opcode(rv_decode *dec, rv_isa isa)
+             case 2: op = rv_op_sw; break;
+             case 3: op = rv_op_sd; break;
+             case 4: op = rv_op_sq; break;
++            case 7: op = rv_op_st; break;
+             }
+             break;
+         case 9:
+diff --git a/hw/riscv/riscv_hart.c b/hw/riscv/riscv_hart.c
+index ca69a1bcd8..4aab7c404d 100644
+--- a/hw/riscv/riscv_hart.c
++++ b/hw/riscv/riscv_hart.c
+@@ -28,6 +28,7 @@
+ static Property riscv_harts_props[] = {
+     DEFINE_PROP_UINT32("num-harts", RISCVHartArrayState, num_harts, 1),
+     DEFINE_PROP_STRING("cpu-type", RISCVHartArrayState, cpu_type),
++    DEFINE_PROP_LINK("tag-sysmem", RISCVHartArrayState, tag_sysmem, TYPE_MEMORY_REGION, MemoryRegion *),
+     DEFINE_PROP_END_OF_LIST(),
+ };
+ 
+@@ -50,6 +51,7 @@ static void riscv_harts_realize(DeviceState *dev, Error **errp)
+                                 sizeof(RISCVCPU), s->cpu_type,
+                                 &error_abort, NULL);
+         s->harts[n].env.mhartid = n;
++        object_property_set_link(OBJECT(&s->harts[n]), OBJECT(s->tag_sysmem), "tag-memory", &error_abort);
+         qemu_register_reset(riscv_harts_cpu_reset, &s->harts[n]);
+         object_property_set_bool(OBJECT(&s->harts[n]), true,
+                                  "realized", &err);
+diff --git a/hw/riscv/virt.c b/hw/riscv/virt.c
+index 25faf3b417..3b349e0f4f 100644
+--- a/hw/riscv/virt.c
++++ b/hw/riscv/virt.c
+@@ -374,6 +374,7 @@ static void riscv_virt_board_init(MachineState *machine)
+     MemoryRegion *system_memory = get_system_memory();
+     MemoryRegion *main_mem = g_new(MemoryRegion, 1);
+     MemoryRegion *mask_rom = g_new(MemoryRegion, 1);
++    MemoryRegion *tag_sysmem = g_new(MemoryRegion, 1);
+     char *plic_hart_config;
+     size_t plic_hart_config_len;
+     int i;
+@@ -387,15 +388,24 @@ static void riscv_virt_board_init(MachineState *machine)
+                             &error_abort);
+     object_property_set_int(OBJECT(&s->soc), smp_cpus, "num-harts",
+                             &error_abort);
++
++    memory_region_init_ram(tag_sysmem, NULL, "tag-sysmem",
++                           machine->ram_size / 16, &error_fatal);
++
++    object_property_set_link(OBJECT(&s->soc), OBJECT(tag_sysmem),
++                             "tag-sysmem", &error_abort);
++
+     object_property_set_bool(OBJECT(&s->soc), true, "realized",
+                             &error_abort);
+ 
++
+     /* register system main memory (actual RAM) */
+     memory_region_init_ram(main_mem, NULL, "riscv_virt_board.ram",
+                            machine->ram_size, &error_fatal);
+     memory_region_add_subregion(system_memory, memmap[VIRT_DRAM].base,
+         main_mem);
+ 
++
+     /* create device tree */
+     fdt = create_fdt(s, memmap, machine->ram_size, machine->kernel_cmdline);
+ 
+@@ -405,6 +415,7 @@ static void riscv_virt_board_init(MachineState *machine)
+     memory_region_add_subregion(system_memory, memmap[VIRT_MROM].base,
+                                 mask_rom);
+ 
++
+     riscv_find_and_load_firmware(machine, BIOS_FILENAME,
+                                  memmap[VIRT_DRAM].base);
+ 
+diff --git a/include/exec/cpu-all.h b/include/exec/cpu-all.h
+index 536ea58f81..416de1205b 100644
+--- a/include/exec/cpu-all.h
++++ b/include/exec/cpu-all.h
+@@ -32,6 +32,28 @@
+ #define EXCP_YIELD      0x10004 /* cpu wants to yield timeslice to another */
+ #define EXCP_ATOMIC     0x10005 /* stop-the-world and emulate atomic */
+ 
++/**
++ * probe_access_flags:
++ * @env: CPUArchState
++ * @addr: guest virtual address to look up
++ * @access_type: read, write or execute permission
++ * @mmu_idx: MMU index to use for lookup
++ * @nonfault: suppress the fault
++ * @phost: return value for host address
++ * @retaddr: return address for unwinding
++ *
++ * Similar to probe_access, loosely returning the TLB_FLAGS_MASK for
++ * the page, and storing the host address for RAM in @phost.
++ *
++ * If @nonfault is set, do not raise an exception but return TLB_INVALID_MASK.
++ * Do not handle watchpoints, but include TLB_WATCHPOINT in the returned flags.
++ * Do handle clean pages, so exclude TLB_NOTDIRY from the returned flags.
++ * For simplicity, all "mmio-like" flags are folded to TLB_MMIO.
++ */
++int probe_access_flags(CPUArchState *env, target_ulong addr,
++		       MMUAccessType access_type, int mmu_idx,
++		       bool nonfault, void **phost, uintptr_t retaddr);
++
+ /* some important defines:
+  *
+  * HOST_WORDS_BIGENDIAN : if defined, the host cpu is big endian and
+diff --git a/include/hw/riscv/riscv_hart.h b/include/hw/riscv/riscv_hart.h
+index 0671d88a44..13f3496ee6 100644
+--- a/include/hw/riscv/riscv_hart.h
++++ b/include/hw/riscv/riscv_hart.h
+@@ -34,6 +34,7 @@ typedef struct RISCVHartArrayState {
+     uint32_t num_harts;
+     char *cpu_type;
+     RISCVCPU *harts;
++    MemoryRegion *tag_sysmem;
+ } RISCVHartArrayState;
+ 
+ #endif
+diff --git a/target/riscv/cpu.c b/target/riscv/cpu.c
+index f8d07bd20a..6ee8f6e90d 100644
+--- a/target/riscv/cpu.c
++++ b/target/riscv/cpu.c
+@@ -410,6 +410,10 @@ static void riscv_cpu_realize(DeviceState *dev, Error **errp)
+         set_misa(env, RVXLEN | target_misa);
+     }
+ 
++    cs->num_ases = 2;
++    cpu_address_space_init(cs, 1, "tag-memory", cpu->tagmemory);
++    cpu_address_space_init(cs, 0, "cpu-memory", cs->memory);
++
+     riscv_cpu_register_gdb_regs_for_features(cs);
+ 
+     qemu_init_vcpu(cs);
+@@ -422,6 +426,13 @@ static void riscv_cpu_init(Object *obj)
+ {
+     RISCVCPU *cpu = RISCV_CPU(obj);
+ 
++    object_property_add_link(obj, "tag-memory",
++                             TYPE_MEMORY_REGION,
++                             (Object **)&cpu->tagmemory,
++                             qdev_prop_allow_set_link_before_realize,
++                             OBJ_PROP_LINK_STRONG,
++                             &error_abort);
++
+     cpu_set_cpustate_pointers(cpu);
+ }
+ 
+diff --git a/target/riscv/cpu.h b/target/riscv/cpu.h
+index 0adb307f32..9d6774488d 100644
+--- a/target/riscv/cpu.h
++++ b/target/riscv/cpu.h
+@@ -121,6 +121,10 @@ struct CPURISCVState {
+     target_ulong mhartid;
+     target_ulong mstatus;
+ 
++    /* FIXME: Special user mode register to control MTE feature */
++    target_ulong mtecontrol;
++    /* FIXME: Special user mode register to control MPK feature */
++    target_ulong mpkcontrol;
+     /*
+      * CAUTION! Unlike the rest of this struct, mip is accessed asynchonously
+      * by I/O threads. It should be read with atomic_read. It should be updated
+@@ -231,6 +235,7 @@ typedef struct RISCVCPU {
+         bool mmu;
+         bool pmp;
+     } cfg;
++    MemoryRegion *tagmemory;
+ } RISCVCPU;
+ 
+ static inline int riscv_has_ext(CPURISCVState *env, target_ulong ext)
+diff --git a/target/riscv/cpu_bits.h b/target/riscv/cpu_bits.h
+index 11f971ad5d..4bb809b111 100644
+--- a/target/riscv/cpu_bits.h
++++ b/target/riscv/cpu_bits.h
+@@ -114,6 +114,13 @@
+ #define CSR_HPMCOUNTER30H   0xc9e
+ #define CSR_HPMCOUNTER31H   0xc9f
+ 
++/* Custom user register */
++#define CSR_MTECONTROL      0x8c0
++#define CSR_MPKCONTROL      0x8c1
++
++/* FIXME: for test purposes only*/
++#define CSR_EXIT            0x8c3
++
+ /* Machine Timers and Counters */
+ #define CSR_MCYCLE          0xb00
+ #define CSR_MINSTRET        0xb02
+@@ -495,6 +502,7 @@
+ #define RISCV_EXCP_INST_PAGE_FAULT         0xc /* since: priv-1.10.0 */
+ #define RISCV_EXCP_LOAD_PAGE_FAULT         0xd /* since: priv-1.10.0 */
+ #define RISCV_EXCP_STORE_PAGE_FAULT        0xf /* since: priv-1.10.0 */
++#define RISCV_EXCP_SECURE_MONITOR_FAULT    0x10
+ 
+ #define RISCV_EXCP_INT_FLAG                0x80000000
+ #define RISCV_EXCP_INT_MASK                0x7fffffff
+diff --git a/target/riscv/csr.c b/target/riscv/csr.c
+index e0d4586760..7d32729c67 100644
+--- a/target/riscv/csr.c
++++ b/target/riscv/csr.c
+@@ -176,6 +176,52 @@ static int write_fcsr(CPURISCVState *env, int csrno, target_ulong val)
+     return 0;
+ }
+ 
++/* FIXME: for test purposes only, remove later */
++static int write_exit(CPURISCVState *env, int csrno, target_ulong val)
++{
++    exit(val);
++}
++
++static int read_exit(CPURISCVState *env, int csrno, target_ulong *val)
++{
++    *val = 0;
++    return 0;
++}
++
++/* FIXME: functions to access user mode register which controls MTE feature */
++static int read_mtecontrol(CPURISCVState *env, int csrno, target_ulong *val)
++{
++    *val = env->mtecontrol;
++    return 0;
++}
++
++static int write_mtecontrol(CPURISCVState *env, int csrno, target_ulong val)
++{
++    /* flush translation cache */
++    if (val != env->mtecontrol) {
++        tb_flush(env_cpu(env));
++    }
++    env->mtecontrol = val;
++    return 0;
++}
++
++/* FIXME: functions to access user mode register which controls MPK feature */
++static int read_mpkcontrol(CPURISCVState *env, int csrno, target_ulong *val)
++{
++    *val = env->mpkcontrol;
++    return 0;
++}
++
++static int write_mpkcontrol(CPURISCVState *env, int csrno, target_ulong val)
++{
++    /* flush translation cache */
++    if (val != env->mpkcontrol) {
++        tb_flush(env_cpu(env));
++    }
++    env->mpkcontrol = val;
++    return 0;
++}
++
+ /* User Timers and Counters */
+ static int read_instret(CPURISCVState *env, int csrno, target_ulong *val)
+ {
+@@ -875,6 +921,8 @@ static riscv_csr_operations csr_ops[CSR_TABLE_SIZE] = {
+     [CSR_FCSR] =                { fs,   read_fcsr,        write_fcsr        },
+ 
+     /* User Timers and Counters */
++    [CSR_MTECONTROL] =          { any,  read_mtecontrol,  write_mtecontrol  },
++    [CSR_MPKCONTROL] =          { any,  read_mpkcontrol,  write_mpkcontrol  },
+     [CSR_CYCLE] =               { ctr,  read_instret                        },
+     [CSR_INSTRET] =             { ctr,  read_instret                        },
+ #if defined(TARGET_RISCV32)
+@@ -891,6 +939,9 @@ static riscv_csr_operations csr_ops[CSR_TABLE_SIZE] = {
+ #endif
+ #endif
+ 
++    /* FIXME: for test purposes only*/
++    [CSR_EXIT] =                { any,  read_exit,        write_exit        },
++
+ #if !defined(CONFIG_USER_ONLY)
+     /* Machine Timers and Counters */
+     [CSR_MCYCLE] =              { any,  read_instret                        },
+diff --git a/target/riscv/helper.h b/target/riscv/helper.h
+index debb22a480..db0db394ff 100644
+--- a/target/riscv/helper.h
++++ b/target/riscv/helper.h
+@@ -66,6 +66,12 @@ DEF_HELPER_FLAGS_2(fcvt_d_lu, TCG_CALL_NO_RWG, i64, env, tl)
+ #endif
+ DEF_HELPER_FLAGS_1(fclass_d, TCG_CALL_NO_RWG_SE, tl, i64)
+ 
++DEF_HELPER_2(load_tag, tl, env, tl)
++DEF_HELPER_3(store_tag, tl, env, tl, tl)
++DEF_HELPER_3(check_tag, void, env, tl, tl)
++DEF_HELPER_2(check_pk_access, void, env, tl)
++DEF_HELPER_2(check_pk_write, void, env, tl)
++
+ /* Special functions */
+ DEF_HELPER_3(csrrw, tl, env, tl, tl)
+ DEF_HELPER_4(csrrs, tl, env, tl, tl, tl)
+diff --git a/target/riscv/insn32-64.decode b/target/riscv/insn32-64.decode
+index 380bf791bc..f16936242c 100644
+--- a/target/riscv/insn32-64.decode
++++ b/target/riscv/insn32-64.decode
+@@ -25,6 +25,8 @@
+ 
+ # *** RV64I Base Instruction Set (in addition to RV32I) ***
+ lwu      ............   ..... 110 ..... 0000011 @i
++lt       ............   ..... 111 ..... 0000011 @i
++st       ....... .....  ..... 111 ..... 0100011 @s
+ ld       ............   ..... 011 ..... 0000011 @i
+ sd       ....... .....  ..... 011 ..... 0100011 @s
+ addiw    ............   ..... 000 ..... 0011011 @i
+diff --git a/target/riscv/insn_trans/trans_rva.inc.c b/target/riscv/insn_trans/trans_rva.inc.c
+index fadd88849e..284a703c4c 100644
+--- a/target/riscv/insn_trans/trans_rva.inc.c
++++ b/target/riscv/insn_trans/trans_rva.inc.c
+@@ -26,13 +26,16 @@ static inline bool gen_lr(DisasContext *ctx, arg_atomic *a, TCGMemOp mop)
+     if (a->rl) {
+         tcg_gen_mb(TCG_MO_ALL | TCG_BAR_STRL);
+     }
+-    tcg_gen_qemu_ld_tl(load_val, src1, ctx->mem_idx, mop);
++    TCGv clean_addr = clean_data_tbi(ctx, src1);
++    tcg_gen_qemu_ld_tl(load_val, clean_addr, ctx->mem_idx, mop);
++
+     if (a->aq) {
+         tcg_gen_mb(TCG_MO_ALL | TCG_BAR_LDAQ);
+     }
+-    tcg_gen_mov_tl(load_res, src1);
++    tcg_gen_mov_tl(load_res, clean_addr);
+     gen_set_gpr(a->rd, load_val);
+ 
++    tcg_temp_free(clean_addr);
+     tcg_temp_free(src1);
+     return true;
+ }
+@@ -46,7 +49,8 @@ static inline bool gen_sc(DisasContext *ctx, arg_atomic *a, TCGMemOp mop)
+     TCGLabel *l2 = gen_new_label();
+ 
+     gen_get_gpr(src1, a->rs1);
+-    tcg_gen_brcond_tl(TCG_COND_NE, load_res, src1, l1);
++    TCGv clean_addr = clean_data_tbi(ctx, src1);
++    tcg_gen_brcond_tl(TCG_COND_NE, load_res, clean_addr, l1);
+ 
+     gen_get_gpr(src2, a->rs2);
+     /*
+@@ -75,6 +79,7 @@ static inline bool gen_sc(DisasContext *ctx, arg_atomic *a, TCGMemOp mop)
+      */
+     tcg_gen_movi_tl(load_res, -1);
+ 
++    tcg_temp_free(clean_addr);
+     tcg_temp_free(dat);
+     tcg_temp_free(src1);
+     tcg_temp_free(src2);
+@@ -91,9 +96,12 @@ static bool gen_amo(DisasContext *ctx, arg_atomic *a,
+     gen_get_gpr(src1, a->rs1);
+     gen_get_gpr(src2, a->rs2);
+ 
+-    (*func)(src2, src1, src2, ctx->mem_idx, mop);
++    TCGv clean_addr = clean_data_tbi(ctx, src1);
++
++    (*func)(src2, clean_addr, src2, ctx->mem_idx, mop);
+ 
+     gen_set_gpr(a->rd, src2);
++    tcg_temp_free(clean_addr);
+     tcg_temp_free(src1);
+     tcg_temp_free(src2);
+     return true;
+diff --git a/target/riscv/insn_trans/trans_rvd.inc.c b/target/riscv/insn_trans/trans_rvd.inc.c
+index 393fa0248c..8884c725e1 100644
+--- a/target/riscv/insn_trans/trans_rvd.inc.c
++++ b/target/riscv/insn_trans/trans_rvd.inc.c
+@@ -20,31 +20,35 @@
+ 
+ static bool trans_fld(DisasContext *ctx, arg_fld *a)
+ {
+-    TCGv t0 = tcg_temp_new();
+-    gen_get_gpr(t0, a->rs1);
++    TCGv raw_addr = tcg_temp_new();
++    gen_get_gpr(raw_addr, a->rs1);
++    TCGv clean_addr = clean_data_tbi(ctx, raw_addr);
+     REQUIRE_FPU;
+     REQUIRE_EXT(ctx, RVD);
+-    tcg_gen_addi_tl(t0, t0, a->imm);
++    tcg_gen_addi_tl(clean_addr, clean_addr, a->imm);
+ 
+-    tcg_gen_qemu_ld_i64(cpu_fpr[a->rd], t0, ctx->mem_idx, MO_TEQ);
++    tcg_gen_qemu_ld_i64(cpu_fpr[a->rd], clean_addr, ctx->mem_idx, MO_TEQ);
+ 
+     mark_fs_dirty(ctx);
+-    tcg_temp_free(t0);
++    tcg_temp_free(raw_addr);
++    tcg_temp_free(clean_addr);
+     return true;
+ }
+ 
+ static bool trans_fsd(DisasContext *ctx, arg_fsd *a)
+ {
+-    TCGv t0 = tcg_temp_new();
+-    gen_get_gpr(t0, a->rs1);
++    TCGv raw_addr = tcg_temp_new();
++    gen_get_gpr(raw_addr, a->rs1);
++    TCGv clean_addr = clean_data_tbi(ctx, raw_addr);
+     REQUIRE_FPU;
+     REQUIRE_EXT(ctx, RVD);
+-    tcg_gen_addi_tl(t0, t0, a->imm);
++    tcg_gen_addi_tl(clean_addr, clean_addr, a->imm);
+ 
+-    tcg_gen_qemu_st_i64(cpu_fpr[a->rs2], t0, ctx->mem_idx, MO_TEQ);
++    tcg_gen_qemu_st_i64(cpu_fpr[a->rs2], clean_addr, ctx->mem_idx, MO_TEQ);
+ 
+     mark_fs_dirty(ctx);
+-    tcg_temp_free(t0);
++    tcg_temp_free(raw_addr);
++    tcg_temp_free(clean_addr);
+     return true;
+ }
+ 
+diff --git a/target/riscv/insn_trans/trans_rvf.inc.c b/target/riscv/insn_trans/trans_rvf.inc.c
+index 172dbfa919..e3c44ec286 100644
+--- a/target/riscv/insn_trans/trans_rvf.inc.c
++++ b/target/riscv/insn_trans/trans_rvf.inc.c
+@@ -25,33 +25,37 @@
+ 
+ static bool trans_flw(DisasContext *ctx, arg_flw *a)
+ {
+-    TCGv t0 = tcg_temp_new();
+-    gen_get_gpr(t0, a->rs1);
++    TCGv raw_addr = tcg_temp_new();
++    gen_get_gpr(raw_addr, a->rs1);
++    TCGv clean_addr = clean_data_tbi(ctx, raw_addr);
+     REQUIRE_FPU;
+     REQUIRE_EXT(ctx, RVF);
+-    tcg_gen_addi_tl(t0, t0, a->imm);
++    tcg_gen_addi_tl(clean_addr, clean_addr, a->imm);
+ 
+-    tcg_gen_qemu_ld_i64(cpu_fpr[a->rd], t0, ctx->mem_idx, MO_TEUL);
++    tcg_gen_qemu_ld_i64(cpu_fpr[a->rd], clean_addr, ctx->mem_idx, MO_TEUL);
+     /* RISC-V requires NaN-boxing of narrower width floating point values */
+     tcg_gen_ori_i64(cpu_fpr[a->rd], cpu_fpr[a->rd], 0xffffffff00000000ULL);
+ 
+-    tcg_temp_free(t0);
++    tcg_temp_free(clean_addr);
++    tcg_temp_free(raw_addr);
+     mark_fs_dirty(ctx);
+     return true;
+ }
+ 
+ static bool trans_fsw(DisasContext *ctx, arg_fsw *a)
+ {
+-    TCGv t0 = tcg_temp_new();
+-    gen_get_gpr(t0, a->rs1);
++    TCGv raw_addr = tcg_temp_new();
++    gen_get_gpr(raw_addr, a->rs1);
++    TCGv clean_addr = clean_data_tbi(ctx, raw_addr);
+ 
+     REQUIRE_FPU;
+     REQUIRE_EXT(ctx, RVF);
+-    tcg_gen_addi_tl(t0, t0, a->imm);
++    tcg_gen_addi_tl(clean_addr, clean_addr, a->imm);
+ 
+-    tcg_gen_qemu_st_i64(cpu_fpr[a->rs2], t0, ctx->mem_idx, MO_TEUL);
++    tcg_gen_qemu_st_i64(cpu_fpr[a->rs2], clean_addr, ctx->mem_idx, MO_TEUL);
+ 
+-    tcg_temp_free(t0);
++    tcg_temp_free(clean_addr);
++    tcg_temp_free(raw_addr);
+     mark_fs_dirty(ctx);
+     return true;
+ }
+diff --git a/target/riscv/insn_trans/trans_rvi.inc.c b/target/riscv/insn_trans/trans_rvi.inc.c
+index ea6473111c..d4fcef691b 100644
+--- a/target/riscv/insn_trans/trans_rvi.inc.c
++++ b/target/riscv/insn_trans/trans_rvi.inc.c
+@@ -18,6 +18,7 @@
+  * this program.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++
+ static bool trans_illegal(DisasContext *ctx, arg_empty *a)
+ {
+     gen_exception_illegal(ctx);
+@@ -137,15 +138,19 @@ static bool trans_bgeu(DisasContext *ctx, arg_bgeu *a)
+ 
+ static bool gen_load(DisasContext *ctx, arg_lb *a, TCGMemOp memop)
+ {
+-    TCGv t0 = tcg_temp_new();
++    TCGv raw_addr = tcg_temp_new();
+     TCGv t1 = tcg_temp_new();
+-    gen_get_gpr(t0, a->rs1);
+-    tcg_gen_addi_tl(t0, t0, a->imm);
++    gen_get_gpr(raw_addr, a->rs1);
++    TCGv clean_addr = clean_data_tbi(ctx, raw_addr);
++    tcg_gen_addi_tl(clean_addr, clean_addr, a->imm);
+ 
+-    tcg_gen_qemu_ld_tl(t1, t0, ctx->mem_idx, memop);
++    tcg_gen_qemu_ld_tl(t1, clean_addr, ctx->mem_idx, memop);
+     gen_set_gpr(a->rd, t1);
+-    tcg_temp_free(t0);
++
++    tcg_temp_free(clean_addr);
+     tcg_temp_free(t1);
++    tcg_temp_free(raw_addr);
++
+     return true;
+ }
+ 
+@@ -176,19 +181,20 @@ static bool trans_lhu(DisasContext *ctx, arg_lhu *a)
+ 
+ static bool gen_store(DisasContext *ctx, arg_sb *a, TCGMemOp memop)
+ {
+-    TCGv t0 = tcg_temp_new();
++    TCGv raw_addr = tcg_temp_new();
+     TCGv dat = tcg_temp_new();
+-    gen_get_gpr(t0, a->rs1);
+-    tcg_gen_addi_tl(t0, t0, a->imm);
++    gen_get_gpr(raw_addr, a->rs1);
++    TCGv clean_addr = clean_data_tbi(ctx, raw_addr);
++    tcg_gen_addi_tl(clean_addr, clean_addr, a->imm);
+     gen_get_gpr(dat, a->rs2);
+ 
+-    tcg_gen_qemu_st_tl(dat, t0, ctx->mem_idx, memop);
+-    tcg_temp_free(t0);
++    tcg_gen_qemu_st_tl(dat, clean_addr, ctx->mem_idx, memop);
++    tcg_temp_free(clean_addr);
+     tcg_temp_free(dat);
++    tcg_temp_free(raw_addr);
+     return true;
+ }
+ 
+-
+ static bool trans_sb(DisasContext *ctx, arg_sb *a)
+ {
+     return gen_store(ctx, a, MO_SB);
+@@ -205,6 +211,41 @@ static bool trans_sw(DisasContext *ctx, arg_sw *a)
+ }
+ 
+ #ifdef TARGET_RISCV64
++
++static bool trans_st(DisasContext *ctx, arg_st *a)
++{
++    TCGv data, addr, dest;
++    dest = tcg_temp_new();
++    data = tcg_temp_new();
++    addr = tcg_temp_new();
++    gen_get_gpr(addr, a->rs1);
++    tcg_gen_addi_tl(addr, addr, a->imm);
++    gen_get_gpr(data, a->rs2);
++
++    gen_helper_store_tag(dest, cpu_env, addr, data);
++
++    tcg_temp_free(addr);
++    tcg_temp_free(data);
++    tcg_temp_free(dest);
++    return true;
++}
++
++static bool trans_lt(DisasContext *ctx, arg_lt *a)
++{
++    TCGv dest, addr;
++    dest = tcg_temp_new();
++    addr = tcg_temp_new();
++    gen_get_gpr(addr, a->rs1);
++    tcg_gen_addi_tl(addr, addr, a->imm);
++
++    gen_helper_load_tag(dest, cpu_env, addr);
++
++    gen_set_gpr(a->rd, dest);
++    tcg_temp_free(dest);
++    tcg_temp_free(addr);
++    return true;
++}
++
+ static bool trans_lwu(DisasContext *ctx, arg_lwu *a)
+ {
+     return gen_load(ctx, a, MO_TEUL);
+diff --git a/target/riscv/op_helper.c b/target/riscv/op_helper.c
+index 331cc36232..f4aa8641f3 100644
+--- a/target/riscv/op_helper.c
++++ b/target/riscv/op_helper.c
+@@ -24,6 +24,164 @@
+ #include "exec/exec-all.h"
+ #include "exec/helper-proto.h"
+ 
++#include "exec/exec-all.h"
++#include "exec/cpu_ldst.h"
++#include "exec/ram_addr.h"
++#include "qemu/qemu-print.h"
++
++#define LOG2_TAG_GRANULE 4
++#define TAG_GRANULE      (1 << LOG2_TAG_GRANULE)
++
++/**
++ * allocation_tag_mem:
++ * @env: the cpu environment
++ * @ptr_mmu_idx: the addressing regime to use for the virtual address
++ * @ptr: the virtual address for which to look up tag memory
++ * @ptr_access: the access to use for the virtual address
++ * @ptr_size: the number of bytes in the normal memory access
++ * @tag_access: the access to use for the tag memory
++ * @tag_size: the number of bytes in the tag memory access
++ * @ra: the return address for exception handling
++ *
++ * Our tag memory is formatted as a sequence of little-endian nibbles.
++ * That is, the byte at (addr >> (LOG2_TAG_GRANULE + 1)) contains two
++ * tags, with the tag at [3:0] for the lower addr and the tag at [7:4]
++ * for the higher addr.
++ *
++ * Here, resolve the physical address from the virtual address, and return
++ * a pointer to the corresponding tag byte.  Exit with exception if the
++ * virtual address is not accessible for @ptr_access.
++ *
++ * The @ptr_size and @tag_size values may not have an obvious relation
++ * due to the alignment of @ptr, and the number of tag checks required.
++ *
++ * If there is no tag storage corresponding to @ptr, return NULL.
++ */
++static uint8_t *allocation_tag_mem(CPURISCVState *env, int ptr_mmu_idx,
++                                   uint64_t ptr, MMUAccessType ptr_access,
++                                   int ptr_size, MMUAccessType tag_access,
++                                   int tag_size, uintptr_t ra)
++{
++    uintptr_t index;
++    CPUIOTLBEntry *iotlbentry;
++    int in_page, flags;
++    ram_addr_t ptr_ra;
++    hwaddr ptr_paddr, tag_paddr, xlat;
++    MemoryRegion *mr;
++    AddressSpace *tag_as;
++    void *host;
++
++    /*
++     * The caller must split calls to this function such that it will
++     * not access *tag* memory beyond the end of the page.
++     */
++    in_page = -(ptr | -(TARGET_PAGE_SIZE >> (LOG2_TAG_GRANULE + 1)));
++    g_assert(tag_size <= in_page);
++
++    /*
++     * Probe the first byte of the virtual address.  This raises an
++     * exception for inaccessible pages, and resolves the virtual address
++     * into the softmmu tlb.
++     */
++    flags = probe_access_flags(env, ptr, ptr_access, ptr_mmu_idx,
++                               false, &host, ra);
++
++    /*
++     * Find the iotlbentry for ptr.  This *must* be present in the TLB
++     * because we just found the mapping.
++     * TODO: Perhaps there should be a cputlb helper that returns a
++     * matching tlb entry + iotlb entry.
++     */
++    index = tlb_index(env, ptr_mmu_idx, ptr);
++    iotlbentry = &env_tlb(env)->d[ptr_mmu_idx].iotlb[index];
++
++#if 0
++    /* If the virtual page MemAttr != Tagged, access unchecked. */
++    if (!iotlbentry->attrs.target_tlb_bit1) {
++        return NULL;
++    }
++#endif
++
++    /* If not normal memory, tag storage is not implemented, access unchecked. */
++    if (unlikely(flags & TLB_MMIO)) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "Page @ 0x%" PRIx64 " indicates Tagged Normal memory "
++                      "but is Device memory\n", ptr);
++        return NULL;
++    }
++
++    /*
++     * The Normal memory access can extend to the next page.  E.g. a single
++     * 8-byte access to the last byte of a page will check only the last
++     * tag on the first page.
++     * Any page access exception has priority over tag check exception.
++     */
++    in_page = -(ptr | TARGET_PAGE_MASK);
++    if (unlikely(ptr_size > in_page)) {
++        void *ignore;
++        flags |= probe_access_flags(env, ptr + in_page, ptr_access,
++                                    ptr_mmu_idx, false, &ignore, ra);
++    }
++
++#if 0
++    /* Any debug exception has priority over a tag check exception. */
++    if (unlikely(flags & TLB_WATCHPOINT)) {
++        int wp = ptr_access == MMU_DATA_LOAD ? BP_MEM_READ : BP_MEM_WRITE;
++        cpu_check_watchpoint(env_cpu(env), ptr, ptr_size,
++                             iotlbentry->attrs, wp, ra);
++    }
++#endif
++
++    /*
++     * Find the physical address within the normal mem space.
++     * The memory region lookup must succeed because TLB_MMIO was
++     * not set in the cputlb lookup above.
++     */
++    mr = memory_region_from_host(host, &ptr_ra);
++    tcg_debug_assert(mr != NULL);
++    tcg_debug_assert(memory_region_is_ram(mr));
++    ptr_paddr = ptr_ra;
++    /*
++    do {
++        ptr_paddr += mr->addr;
++        mr = mr->container;
++    } while (mr);
++*/
++    /* Convert to the physical address in tag space.  */
++    tag_paddr = ptr_paddr >> (LOG2_TAG_GRANULE + 1);
++
++    /* Look up the address in tag space. */
++    tag_as = cpu_get_address_space(env_cpu(env), 1);
++    mr = address_space_translate(tag_as, tag_paddr, &xlat, NULL,
++                                 tag_access == MMU_DATA_STORE,
++                                 iotlbentry->attrs);
++
++    /*
++     * Note that @mr will never be NULL.  If there is nothing in the address
++     * space at @tag_paddr, the translation will return the unallocated memory
++     * region.  For our purposes, the result must be ram.
++     */
++    if (unlikely(!memory_region_is_ram(mr))) {
++        /* ??? Failure is a board configuration error. */
++        qemu_log_mask(LOG_UNIMP,
++                      "Tag Memory @ 0x%" HWADDR_PRIx " not found for "
++                      "Normal Memory @ 0x%" HWADDR_PRIx "\n",
++                      tag_paddr, ptr_paddr);
++        return NULL;
++    }
++
++    /*
++     * Ensure the tag memory is dirty on write, for migration.
++     * Tag memory can never contain code or display memory (vga).
++     */
++    if (tag_access == MMU_DATA_STORE) {
++        ram_addr_t tag_ra = memory_region_get_ram_addr(mr) + xlat;
++        cpu_physical_memory_set_dirty_flag(tag_ra, DIRTY_MEMORY_MIGRATION);
++    }
++
++    return memory_region_get_ram_ptr(mr) + xlat;
++}
++
+ /* Exceptions processing helpers */
+ void QEMU_NORETURN riscv_raise_exception(CPURISCVState *env,
+                                           uint32_t exception, uintptr_t pc)
+@@ -39,6 +197,98 @@ void helper_raise_exception(CPURISCVState *env, uint32_t exception)
+     riscv_raise_exception(env, exception, 0);
+ }
+ 
++/* For use in a non-parallel context, store to the given nibble.  */
++static void store_tag1(uint64_t ptr, uint8_t *mem, int tag)
++{
++    int ofs = extract32(ptr, LOG2_TAG_GRANULE, 1) * 4;
++    *mem = deposit32(*mem, ofs, 8, tag);
++}
++
++static int load_tag1(uint64_t ptr, uint8_t *mem)
++{
++    int ofs = extract32(ptr, LOG2_TAG_GRANULE, 1) * 4;
++    return extract32(*mem, ofs, 8);
++}
++
++target_ulong helper_store_tag(CPURISCVState *env, target_ulong addr, target_ulong data)
++{
++//    assert(0);
++
++    int mmu_idx = cpu_mmu_index(env, false);
++    uint8_t *mem;
++
++    mem = allocation_tag_mem(env, mmu_idx, addr, MMU_DATA_STORE, TAG_GRANULE,
++			     MMU_DATA_STORE, 1, GETPC());
++    assert(mem);
++    store_tag1(addr, mem, data);
++
++    target_ulong val = 0;
++    return val;
++}
++
++target_ulong helper_load_tag(CPURISCVState *env, target_ulong addr)
++{
++//    assert(0);
++
++    int mmu_idx = cpu_mmu_index(env, false);
++    uint8_t *mem;
++    int rtag = 0;
++
++    mem = allocation_tag_mem(env, mmu_idx, addr, MMU_DATA_LOAD, TAG_GRANULE,
++			     MMU_DATA_LOAD, 1, GETPC());
++    assert(mem);
++    rtag = load_tag1(addr, mem);
++
++
++    return rtag;
++}
++
++void helper_check_tag(CPURISCVState *env, target_ulong tag1, target_ulong tag2)
++{
++    if (tag1 != tag2) {
++        riscv_raise_exception(env, RISCV_EXCP_SECURE_MONITOR_FAULT, GETPC());
++    }
++}
++
++#define BitVal(data, y) ((data >> y) & 1)     //Read bit value
++
++//Read Acces Disable Bit
++static int readAD(target_ulong preg, target_ulong index)
++{
++    index = 15 - index;
++    return BitVal(preg, ((index * 2) + 1));
++}
++//Read Write Disable Bit
++static int readWD(target_ulong preg, target_ulong index)
++{
++    index = 15 - index;
++    return BitVal(preg, index * 2);
++}
++
++void helper_check_pk_access(CPURISCVState *env, target_ulong tag)
++{
++    // Check if mpk custom register value is same with provided/shifted tag
++    //qemu_printf("AD %02X\n", readAD(env->mpkcontrol, tag));
++     //FIXME: Test me! Already. Really? Yes. Ok test the WD.
++    if(readAD(env->mpkcontrol, tag))
++    {
++        riscv_raise_exception(env, RISCV_EXCP_SECURE_MONITOR_FAULT, GETPC());
++    }
++    
++}
++
++void helper_check_pk_write(CPURISCVState *env, target_ulong tag)
++{
++    // Check if mpk custom register value is same with provided/shifted tag
++    //qemu_printf("WD %02X\n", readWD(env->mpkcontrol, tag));
++    //FIXME: Test me!
++    if(readWD(env->mpkcontrol, tag))
++    {
++        riscv_raise_exception(env, RISCV_EXCP_SECURE_MONITOR_FAULT, GETPC());
++    }
++    
++}
++
+ target_ulong helper_csrrw(CPURISCVState *env, target_ulong src,
+         target_ulong csr)
+ {
+diff --git a/target/riscv/translate.c b/target/riscv/translate.c
+index 8d6ab73258..4ee1b8f9cc 100644
+--- a/target/riscv/translate.c
++++ b/target/riscv/translate.c
+@@ -28,6 +28,7 @@
+ 
+ #include "exec/translator.h"
+ #include "exec/log.h"
++#include "qemu/qemu-print.h"
+ 
+ #include "instmap.h"
+ 
+@@ -54,6 +55,8 @@ typedef struct DisasContext {
+        to any system register, which includes CSR_FRM, so we do not have
+        to reset this known value.  */
+     int frm;
++    uint8_t mtecontrol;
++    uint8_t mpkcontrol;
+     bool ext_ifencei;
+ } DisasContext;
+ 
+@@ -103,6 +106,54 @@ static void generate_exception_mbadaddr(DisasContext *ctx, int excp)
+     ctx->base.is_jmp = DISAS_NORETURN;
+ }
+ 
++/* Generates address adjustment for TBI */
++static void gen_top_byte_ignore(DisasContext *s, TCGv_i64 dst,
++                                TCGv_i64 src, int tbi)
++{
++    if (tbi == 0) {
++        /* Load unmodified address */
++        tcg_gen_mov_i64(dst, src);
++    }
++    else {
++        TCGv tagged_addr = tcg_temp_new();
++        TCGv loaded_tag  = tcg_temp_new();
++        TCGv shifted_tag = tcg_temp_new();
++
++        tcg_gen_mov_i64(tagged_addr, src);
++        /* get tag */
++        tcg_gen_shri_i64(shifted_tag, tagged_addr, 56);
++        /* Sign-extend from bit 55.  */
++        tcg_gen_sextract_i64(dst, src, 0, 56);
++        /* load tag from memory*/
++        gen_helper_load_tag(loaded_tag, cpu_env, dst);
++        //FIXME: Differentiate load and store
++        qemu_printf("S->OPCODE %010X\n", s->opcode);
++        
++        if((s->opcode & OPC_RISC_STORE) == OPC_RISC_STORE)
++        {   gen_helper_check_pk_write(cpu_env, shifted_tag);
++        }
++        if((s->opcode & OPC_RISC_LOAD) == OPC_RISC_LOAD)
++        {   gen_helper_check_pk_access(cpu_env, shifted_tag);
++        }
++        
++        /* compare tags and throw exception */
++        gen_helper_check_tag(cpu_env, loaded_tag, shifted_tag);
++        /* Sign-extend from bit 55.  */
++        tcg_gen_sextract_i64(dst, src, 0, 56);
++
++        // FIXME: we should sign extend iff this is user-space address,
++        // that is if high part is 0.
++        // We should not support TBI for priviledged mode at the moment
++    }
++}
++
++static TCGv_i64 clean_data_tbi(DisasContext *s, TCGv_i64 addr)
++{
++    TCGv_i64 clean = tcg_temp_new();
++    gen_top_byte_ignore(s, clean, addr, s->mtecontrol);
++    return clean;
++}
++
+ static void gen_exception_debug(void)
+ {
+     TCGv_i32 helper_tmp = tcg_const_i32(EXCP_DEBUG);
+@@ -341,10 +392,11 @@ static void gen_jal(DisasContext *ctx, int rd, target_ulong imm)
+ static void gen_load_c(DisasContext *ctx, uint32_t opc, int rd, int rs1,
+         target_long imm)
+ {
+-    TCGv t0 = tcg_temp_new();
++    TCGv raw_addr = tcg_temp_new();
+     TCGv t1 = tcg_temp_new();
+-    gen_get_gpr(t0, rs1);
+-    tcg_gen_addi_tl(t0, t0, imm);
++    gen_get_gpr(raw_addr, rs1);
++    TCGv clean_addr = clean_data_tbi(ctx, raw_addr);
++    tcg_gen_addi_tl(clean_addr, clean_addr, imm);
+     int memop = tcg_memop_lookup[(opc >> 12) & 0x7];
+ 
+     if (memop < 0) {
+@@ -352,19 +404,21 @@ static void gen_load_c(DisasContext *ctx, uint32_t opc, int rd, int rs1,
+         return;
+     }
+ 
+-    tcg_gen_qemu_ld_tl(t1, t0, ctx->mem_idx, memop);
++    tcg_gen_qemu_ld_tl(t1, clean_addr, ctx->mem_idx, memop);
+     gen_set_gpr(rd, t1);
+-    tcg_temp_free(t0);
++    tcg_temp_free(raw_addr);
++    tcg_temp_free(clean_addr);
+     tcg_temp_free(t1);
+ }
+ 
+ static void gen_store_c(DisasContext *ctx, uint32_t opc, int rs1, int rs2,
+         target_long imm)
+ {
+-    TCGv t0 = tcg_temp_new();
++    TCGv raw_addr = tcg_temp_new();
+     TCGv dat = tcg_temp_new();
+-    gen_get_gpr(t0, rs1);
+-    tcg_gen_addi_tl(t0, t0, imm);
++    gen_get_gpr(raw_addr, rs1);
++    TCGv clean_addr = clean_data_tbi(ctx, raw_addr);
++    tcg_gen_addi_tl(clean_addr, clean_addr, imm);
+     gen_get_gpr(dat, rs2);
+     int memop = tcg_memop_lookup[(opc >> 12) & 0x7];
+ 
+@@ -373,8 +427,9 @@ static void gen_store_c(DisasContext *ctx, uint32_t opc, int rs1, int rs2,
+         return;
+     }
+ 
+-    tcg_gen_qemu_st_tl(dat, t0, ctx->mem_idx, memop);
+-    tcg_temp_free(t0);
++    tcg_gen_qemu_st_tl(dat, clean_addr, ctx->mem_idx, memop);
++    tcg_temp_free(clean_addr);
++    tcg_temp_free(raw_addr);
+     tcg_temp_free(dat);
+ }
+ #endif
+@@ -408,23 +463,24 @@ static inline void mark_fs_dirty(DisasContext *ctx) { }
+ static void gen_fp_load(DisasContext *ctx, uint32_t opc, int rd,
+         int rs1, target_long imm)
+ {
+-    TCGv t0;
++    TCGv raw_addr;
+ 
+     if (ctx->mstatus_fs == 0) {
+         gen_exception_illegal(ctx);
+         return;
+     }
+ 
+-    t0 = tcg_temp_new();
+-    gen_get_gpr(t0, rs1);
+-    tcg_gen_addi_tl(t0, t0, imm);
++    raw_addr = tcg_temp_new();
++    gen_get_gpr(raw_addr, rs1);
++    TCGv clean_addr = clean_data_tbi(ctx, raw_addr);
++    tcg_gen_addi_tl(clean_addr, clean_addr, imm);
+ 
+     switch (opc) {
+     case OPC_RISC_FLW:
+         if (!has_ext(ctx, RVF)) {
+             goto do_illegal;
+         }
+-        tcg_gen_qemu_ld_i64(cpu_fpr[rd], t0, ctx->mem_idx, MO_TEUL);
++        tcg_gen_qemu_ld_i64(cpu_fpr[rd], clean_addr, ctx->mem_idx, MO_TEUL);
+         /* RISC-V requires NaN-boxing of narrower width floating point values */
+         tcg_gen_ori_i64(cpu_fpr[rd], cpu_fpr[rd], 0xffffffff00000000ULL);
+         break;
+@@ -432,14 +488,15 @@ static void gen_fp_load(DisasContext *ctx, uint32_t opc, int rd,
+         if (!has_ext(ctx, RVD)) {
+             goto do_illegal;
+         }
+-        tcg_gen_qemu_ld_i64(cpu_fpr[rd], t0, ctx->mem_idx, MO_TEQ);
++        tcg_gen_qemu_ld_i64(cpu_fpr[rd], clean_addr, ctx->mem_idx, MO_TEQ);
+         break;
+     do_illegal:
+     default:
+         gen_exception_illegal(ctx);
+         break;
+     }
+-    tcg_temp_free(t0);
++    tcg_temp_free(clean_addr);
++    tcg_temp_free(raw_addr);
+ 
+     mark_fs_dirty(ctx);
+ }
+@@ -454,22 +511,23 @@ static void gen_fp_store(DisasContext *ctx, uint32_t opc, int rs1,
+         return;
+     }
+ 
+-    t0 = tcg_temp_new();
+-    gen_get_gpr(t0, rs1);
+-    tcg_gen_addi_tl(t0, t0, imm);
++    raw_addr = tcg_temp_new();
++    gen_get_gpr(raw_addr, rs1);
++    TCGv clean_addr = clean_data_tbi(ctx, raw_addr);
++    tcg_gen_addi_tl(clean_addr, clean_addr, imm);
+ 
+     switch (opc) {
+     case OPC_RISC_FSW:
+         if (!has_ext(ctx, RVF)) {
+             goto do_illegal;
+         }
+-        tcg_gen_qemu_st_i64(cpu_fpr[rs2], t0, ctx->mem_idx, MO_TEUL);
++        tcg_gen_qemu_st_i64(cpu_fpr[rs2], clean_addr, ctx->mem_idx, MO_TEUL);
+         break;
+     case OPC_RISC_FSD:
+         if (!has_ext(ctx, RVD)) {
+             goto do_illegal;
+         }
+-        tcg_gen_qemu_st_i64(cpu_fpr[rs2], t0, ctx->mem_idx, MO_TEQ);
++        tcg_gen_qemu_st_i64(cpu_fpr[rs2], clean, ctx->mem_idx, MO_TEQ);
+         break;
+     do_illegal:
+     default:
+@@ -477,7 +535,8 @@ static void gen_fp_store(DisasContext *ctx, uint32_t opc, int rs1,
+         break;
+     }
+ 
+-    tcg_temp_free(t0);
++    tcg_temp_free(clean_addr);
++    tcg_temp_free(raw_addr);
+ }
+ #endif
+ 
+@@ -761,6 +820,8 @@ static void riscv_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
+     ctx->priv_ver = env->priv_ver;
+     ctx->misa = env->misa;
+     ctx->frm = -1;  /* unknown rounding mode */
++    ctx->mtecontrol = env->mtecontrol;
++    ctx->mpkcontrol = env->mpkcontrol;
+     ctx->ext_ifencei = cpu->cfg.ext_ifencei;
+ }
+ 
+diff --git a/trace-events b/trace-events
+index aeea3c2bdb..7157db7c21 100644
+--- a/trace-events
++++ b/trace-events
+@@ -52,6 +52,8 @@ dma_map_wait(void *dbs) "dbs=%p"
+ find_ram_offset(uint64_t size, uint64_t offset) "size: 0x%" PRIx64 " @ 0x%" PRIx64
+ find_ram_offset_loop(uint64_t size, uint64_t candidate, uint64_t offset, uint64_t next, uint64_t mingap) "trying size: 0x%" PRIx64 " @ 0x%" PRIx64 ", offset: 0x%" PRIx64" next: 0x%" PRIx64 " mingap: 0x%" PRIx64
+ ram_block_discard_range(const char *rbname, void *hva, size_t length, bool need_madvise, bool need_fallocate, int ret) "%s@%p + 0x%zx: madvise: %d fallocate: %d ret: %d"
++memory_notdirty_write_access(uint64_t vaddr, uint64_t ram_addr, unsigned size) "0x%" PRIx64 " ram_addr 0x%" PRIx64 " size %u"
++memory_notdirty_set_dirty(uint64_t vaddr) "0x%" PRIx64
+ 
+ # memory.c
+ memory_region_ops_read(int cpu_index, void *mr, uint64_t addr, uint64_t value, unsigned size) "cpu %d mr %p addr 0x%"PRIx64" value 0x%"PRIx64" size %u"
